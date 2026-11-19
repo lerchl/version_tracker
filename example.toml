@@ -1,0 +1,14 @@
+# Defaults, overridable per service
+install_dir = "/usr/local/bin"
+asset_name  = "{name}-linux-aarch64"
+
+# The table name is the URL segment, the systemd unit and the binary name
+[services.version_tracker]
+url = "https://github.com/lerchl/version_tracker"
+package_type = "binary"
+
+# [services.other-service]
+# url = "https://github.com/lerchl/other-service"
+# package_type = "binary"
+# asset_name = "{name}-linux-x86_64"
+# install_dir = "/opt/bin"

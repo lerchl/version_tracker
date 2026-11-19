@@ -3,13 +3,13 @@ mod github;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use github::GithubProvider;
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SoftwarePackageType {
     Binary,
     Image,
@@ -21,6 +21,8 @@ pub struct ReleaseInfo {
     pub version: String,
     /// ISO 8601 timestamp
     pub published_at: Option<String>,
+    /// Whether this is the latest release
+    pub latest: bool,
 }
 
 /// A downloadable file belonging to a specific release.
@@ -47,10 +49,6 @@ pub enum ProviderError {
 #[async_trait]
 pub trait VersionProvider: Send + Sync {
     fn name(&self) -> &'static str;
-
-    /// Short name of the software (e.g. the repository name). Used as the
-    /// default service name when deploying.
-    fn software_name(&self) -> &str;
 
     /// Complete list of releases, newest first. Caching and pagination are
     /// handled by the caller.

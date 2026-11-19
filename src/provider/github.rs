@@ -85,13 +85,15 @@ impl VersionProvider for GithubProvider {
         "github"
     }
 
-    fn software_name(&self) -> &str {
-        &self.repo
-    }
-
     async fn fetch_releases(&self) -> Result<Vec<ReleaseInfo>, ProviderError> {
         let (owner, repo) = (&self.owner, &self.repo);
         let mut out = Vec::new();
+
+        // Fetch GitHub's officially designated latest release
+        let latest_tag = self
+            .fetch_release("latest")
+            .await?
+            .map(|release| release.tag_name);
 
         for page in 1..=MAX_PAGES {
             let url = format!(
@@ -104,11 +106,13 @@ impl VersionProvider for GithubProvider {
                 .header("Accept", "application/vnd.github+json")
                 .send()
                 .await?;
+
             let status = response.status();
 
             if status == reqwest::StatusCode::NOT_FOUND {
                 return Err(ProviderError::NotFound);
             }
+
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 return Err(ProviderError::Upstream(format!("{status} {body}")));
@@ -117,14 +121,17 @@ impl VersionProvider for GithubProvider {
             let raw: Vec<GhRelease> = response.json().await?;
             let raw_len = raw.len();
 
-            out.extend(raw.into_iter().map(|r| ReleaseInfo {
-                // The "v" prefix is optional
-                version: r
-                    .tag_name
-                    .strip_prefix(['v', 'V'])
-                    .unwrap_or(&r.tag_name)
-                    .to_owned(),
-                published_at: r.published_at,
+            out.extend(raw.into_iter().map(|r| {
+                ReleaseInfo {
+                    // The "v" prefix is optional
+                    version: r
+                        .tag_name
+                        .strip_prefix(['v', 'V'])
+                        .unwrap_or(&r.tag_name)
+                        .to_owned(),
+                    published_at: r.published_at,
+                    latest: latest_tag.as_deref() == Some(r.tag_name.as_str()),
+                }
             }));
 
             // A short page means we've reached the end
@@ -145,10 +152,12 @@ impl VersionProvider for GithubProvider {
             self.fetch_release("latest").await?
         } else {
             let mut found = self.fetch_release(&format!("tags/{version}")).await?;
+
             // /versions returns tags without the "v", so also accept those
             if found.is_none() && !version.starts_with(['v', 'V']) {
                 found = self.fetch_release(&format!("tags/v{version}")).await?;
             }
+
             found
         }
         .ok_or(ProviderError::NotFound)?;

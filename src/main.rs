@@ -2,16 +2,17 @@ mod deploy;
 mod provider;
 
 use std::{
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{Error, Result};
+use anyhow::{Context, Error, Result};
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{CONTENT_TYPE, ORIGIN},
@@ -31,6 +32,46 @@ use deploy::{DeployError, DeployOptions, DeployOutcome, Deployer, build_deployer
 use provider::{ProviderError, ReleaseInfo, SoftwarePackageType, VersionProvider, build_provider};
 
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+// Would collide with the Swagger UI routes
+const RESERVED_NAMES: &[&str] = &["swagger-ui", "api-docs"];
+
+// ---------- config file ----------
+
+#[derive(Deserialize)]
+struct Config {
+    #[serde(default = "default_install_dir")]
+    install_dir: PathBuf,
+    #[serde(default = "default_asset_name")]
+    asset_name: String,
+    services: BTreeMap<String, ServiceConfig>,
+}
+
+#[derive(Deserialize)]
+struct ServiceConfig {
+    url: String,
+    package_type: SoftwarePackageType,
+    install_dir: Option<PathBuf>,
+    /// "{name}" is replaced by the service name
+    asset_name: Option<String>,
+}
+
+fn default_install_dir() -> PathBuf {
+    PathBuf::from("/usr/local/bin")
+}
+
+fn default_asset_name() -> String {
+    "{name}-linux-aarch64".to_string()
+}
+
+fn valid_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && !RESERVED_NAMES.contains(&name)
+        && !name.starts_with(['.', '-'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
 
 // ---------- types ----------
 
@@ -66,18 +107,31 @@ struct CacheEntry {
     releases: Arc<Vec<ReleaseInfo>>,
 }
 
-#[derive(Clone)]
-struct AppState {
+/// Everything that belongs to one managed service
+struct ServiceEntry {
     provider: Arc<dyn VersionProvider>,
     // Held across the upstream fetch, so concurrent requests on a cold or
     // stale cache trigger only one refresh.
-    cache: Arc<Mutex<Option<CacheEntry>>>,
+    cache: Mutex<Option<CacheEntry>>,
     /// `None` when the package type has no deployer yet
     deployer: Option<Arc<dyn Deployer>>,
-    /// Only one deployment at a time
+    /// Only one deployment at a time, per service
     deploy_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    services: Arc<HashMap<String, Arc<ServiceEntry>>>,
     /// Origins allowed to call the API from a browser (normalized, no trailing slash)
     allowed_origins: Arc<Vec<String>>,
+}
+
+impl AppState {
+    fn service(&self, name: &str) -> Result<Arc<ServiceEntry>, AppError> {
+        self.services.get(name).cloned().ok_or_else(|| {
+            AppError::new(StatusCode::NOT_FOUND, format!("Unknown service '{name}'"))
+        })
+    }
 }
 
 // ---------- errors ----------
@@ -128,16 +182,16 @@ impl From<DeployError> for AppError {
 
 // ---------- cache ----------
 
-async fn cached_releases(state: &AppState) -> Result<Arc<Vec<ReleaseInfo>>, ProviderError> {
-    let mut cache = state.cache.lock().await;
+async fn cached_releases(entry: &ServiceEntry) -> Result<Arc<Vec<ReleaseInfo>>, ProviderError> {
+    let mut cache = entry.cache.lock().await;
 
-    if let Some(entry) = cache.as_ref() {
-        if entry.fetched_at.elapsed() < CACHE_TTL {
-            return Ok(entry.releases.clone());
+    if let Some(c) = cache.as_ref() {
+        if c.fetched_at.elapsed() < CACHE_TTL {
+            return Ok(c.releases.clone());
         }
     }
 
-    match state.provider.fetch_releases().await {
+    match entry.provider.fetch_releases().await {
         Ok(releases) => {
             let releases = Arc::new(releases);
             *cache = Some(CacheEntry {
@@ -148,12 +202,12 @@ async fn cached_releases(state: &AppState) -> Result<Arc<Vec<ReleaseInfo>>, Prov
         }
         Err(e) => {
             // Serve stale data rather than fail if we have any
-            if let Some(entry) = cache.as_ref() {
+            if let Some(c) = cache.as_ref() {
                 tracing::warn!(
                     "refresh from {} failed ({e}), serving stale cache",
-                    state.provider.name()
+                    entry.provider.name()
                 );
-                return Ok(entry.releases.clone());
+                return Ok(c.releases.clone());
             }
             Err(e)
         }
@@ -162,23 +216,28 @@ async fn cached_releases(state: &AppState) -> Result<Arc<Vec<ReleaseInfo>>, Prov
 
 // ---------- handlers ----------
 
-/// List releases of the configured software
+/// List releases of a managed service
 #[utoipa::path(
     get,
-    path = "/versions",
+    path = "/{service}/versions",
     tag = "versions",
-    params(PageQuery),
+    params(
+        ("service" = String, Path, description = "Service name from the config file"),
+        PageQuery
+    ),
     responses(
         (status = 200, description = "Paginated list of releases", body = Paginated<ReleaseInfo>),
-        (status = 404, description = "Software not found at the provider", body = String),
+        (status = 404, description = "Unknown service, or software not found at the provider", body = String),
         (status = 502, description = "Upstream provider error", body = String),
     )
 )]
 async fn get_versions(
     State(state): State<AppState>,
+    Path(service): Path<String>,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Paginated<ReleaseInfo>>, AppError> {
-    let all = cached_releases(&state).await?;
+    let entry = state.service(&service)?;
+    let all = cached_releases(&entry).await?;
 
     let per_page = q.per_page.unwrap_or(30).clamp(1, 100);
     let page = q.page.unwrap_or(1).max(1);
@@ -205,14 +264,17 @@ async fn get_versions(
 /// Requests must carry an `Origin` header matching one of the allowed origins.
 #[utoipa::path(
     post,
-    path = "/deploy",
+    path = "/{service}/deploy",
     tag = "deploy",
-    params(DeployQuery),
+    params(
+        ("service" = String, Path, description = "Service name from the config file"),
+        DeployQuery
+    ),
     responses(
         (status = 200, description = "Deployed", body = DeployOutcome),
         (status = 400, description = "Invalid version", body = String),
         (status = 403, description = "Origin missing or not allowed", body = String),
-        (status = 404, description = "Release or asset not found", body = String),
+        (status = 404, description = "Unknown service, release or asset not found", body = String),
         (status = 409, description = "A deployment is already running", body = String),
         (status = 500, description = "Install or systemctl failure", body = String),
         (status = 501, description = "No deployer for this package type", body = String),
@@ -221,6 +283,7 @@ async fn get_versions(
 )]
 async fn deploy_version(
     State(state): State<AppState>,
+    Path(service): Path<String>,
     headers: HeaderMap,
     Query(q): Query<DeployQuery>,
 ) -> Result<Json<DeployOutcome>, AppError> {
@@ -238,7 +301,9 @@ async fn deploy_version(
         ));
     }
 
-    let deployer = state.deployer.clone().ok_or_else(|| {
+    let entry = state.service(&service)?;
+
+    let deployer = entry.deployer.clone().ok_or_else(|| {
         AppError::new(
             StatusCode::NOT_IMPLEMENTED,
             "Deploying is not supported for this package type yet",
@@ -251,7 +316,7 @@ async fn deploy_version(
     }
 
     let guard =
-        state.deploy_lock.clone().try_lock_owned().map_err(|_| {
+        entry.deploy_lock.clone().try_lock_owned().map_err(|_| {
             AppError::new(StatusCode::CONFLICT, "A deployment is already in progress")
         })?;
 
@@ -287,7 +352,7 @@ fn valid_version(v: &str) -> bool {
     components(schemas(ReleaseInfo, DeployOutcome)),
     info(
         title = "Version Tracker",
-        description = "Release version tracker and deployer"
+        description = "Release version tracker and deployer for multiple services"
     )
 )]
 struct ApiDoc;
@@ -302,25 +367,17 @@ pub struct Args {
     /// Address to listen on. Defaults to loopback; use 0.0.0.0 to expose it.
     #[arg(long, env = "BIND", default_value = "127.0.0.1")]
     bind: IpAddr,
-    #[arg(long, env = "SOFTWARE_URL")]
-    software_url: String,
-    #[arg(long, env = "SOFTWARE_PACKAGE_TYPE")]
-    software_package_type: SoftwarePackageType,
-
+    /// Path to the services config file (TOML)
+    #[arg(
+        long,
+        env = "CONFIG",
+        default_value = "/etc/version-tracker/services.toml"
+    )]
+    config: PathBuf,
     /// Origin(s) the frontend is served from, e.g. https://ui.example.com
-    /// (comma-separated for several). Used for CORS and enforced on /deploy.
+    /// (comma-separated for several). Used for CORS and enforced on deploy.
     #[arg(long, env = "ALLOWED_ORIGIN", required = true, value_delimiter = ',')]
     allowed_origins: Vec<String>,
-
-    /// systemd unit and binary name (default: the repository name)
-    #[arg(long, env = "SERVICE_NAME")]
-    service_name: Option<String>,
-    /// Directory the binary is installed into
-    #[arg(long, env = "INSTALL_DIR", default_value = "/usr/local/bin")]
-    install_dir: PathBuf,
-    /// Release asset to install; "{name}" is replaced by the service name
-    #[arg(long, env = "ASSET_NAME", default_value = "{name}-linux-aarch64")]
-    asset_name: String,
 }
 
 #[tokio::main]
@@ -352,43 +409,69 @@ async fn main() -> Result<(), Error> {
         .collect::<Result<Vec<_>>>()?;
     tracing::info!("allowed origins: {}", allowed_origins.join(", "));
 
+    let config_text = std::fs::read_to_string(&args.config)
+        .with_context(|| format!("Cannot read config file {}", args.config.display()))?;
+    let config: Config = toml::from_str(&config_text)
+        .with_context(|| format!("Invalid config file {}", args.config.display()))?;
+    if config.services.is_empty() {
+        anyhow::bail!("Config file defines no services");
+    }
+
     let client = reqwest::Client::builder()
         .user_agent(concat!("version_tracker/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let provider = build_provider(
-        client.clone(),
-        &args.software_url,
-        args.software_package_type,
-    )?;
-    tracing::info!("using provider: {}", provider.name());
+    let mut services: HashMap<String, Arc<ServiceEntry>> = HashMap::new();
+    for (name, sc) in config.services {
+        if !valid_service_name(&name) {
+            anyhow::bail!("Invalid service name '{name}'");
+        }
 
-    let service_name = args
-        .service_name
-        .unwrap_or_else(|| provider.software_name().to_owned());
-    let asset_name = args.asset_name.replace("{name}", &service_name);
+        let provider = build_provider(client.clone(), &sc.url, sc.package_type)
+            .with_context(|| format!("service '{name}'"))?;
 
-    let deployer = build_deployer(
-        client,
-        provider.clone(),
-        args.software_package_type,
-        DeployOptions {
-            service_name: service_name.clone(),
-            install_dir: args.install_dir,
-            asset_name: asset_name.clone(),
-        },
-    )?;
-    match &deployer {
-        Some(_) => tracing::info!("deploy enabled: service '{service_name}', asset '{asset_name}'"),
-        None => tracing::warn!("deploy disabled: no deployer for this package type yet"),
+        let asset_name = sc
+            .asset_name
+            .unwrap_or_else(|| config.asset_name.clone())
+            .replace("{name}", &name);
+        let install_dir = sc.install_dir.unwrap_or_else(|| config.install_dir.clone());
+
+        let deployer = build_deployer(
+            client.clone(),
+            provider.clone(),
+            sc.package_type,
+            DeployOptions {
+                service_name: name.clone(),
+                install_dir,
+                asset_name: asset_name.clone(),
+            },
+        )
+        .with_context(|| format!("service '{name}'"))?;
+
+        tracing::info!(
+            "service '{name}': provider {}, deploy {}",
+            provider.name(),
+            if deployer.is_some() {
+                format!("enabled (asset '{asset_name}')")
+            } else {
+                "disabled (no deployer for this package type yet)".to_string()
+            }
+        );
+
+        services.insert(
+            name,
+            Arc::new(ServiceEntry {
+                provider,
+                cache: Mutex::new(None),
+                deployer,
+                deploy_lock: Arc::new(Mutex::new(())),
+            }),
+        );
     }
 
     let state = AppState {
-        provider,
-        cache: Arc::new(Mutex::new(None)),
-        deployer,
-        deploy_lock: Arc::new(Mutex::new(())),
+        services: Arc::new(services),
         allowed_origins: Arc::new(allowed_origins),
     };
 
@@ -398,8 +481,8 @@ async fn main() -> Result<(), Error> {
         .allow_headers([CONTENT_TYPE]);
 
     let app = Router::new()
-        .route("/versions", get(get_versions))
-        .route("/deploy", post(deploy_version))
+        .route("/{service}/versions", get(get_versions))
+        .route("/{service}/deploy", post(deploy_version))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state)
         .layer(cors);
