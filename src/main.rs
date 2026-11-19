@@ -2,6 +2,7 @@ mod deploy;
 mod provider;
 
 use std::{
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,19 +12,19 @@ use anyhow::{Error, Result};
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, HeaderValue, Method, StatusCode,
+        header::{CONTENT_TYPE, ORIGIN},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use tokio::{signal, sync::Mutex};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use utoipa::{
-    IntoParams, Modify, OpenApi, ToSchema,
-    openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
-};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use deploy::{DeployError, DeployOptions, DeployOutcome, Deployer, build_deployer};
@@ -66,21 +67,17 @@ struct CacheEntry {
 }
 
 #[derive(Clone)]
-struct DeployState {
-    deployer: Arc<dyn Deployer>,
-    token: Arc<str>,
-}
-
-#[derive(Clone)]
 struct AppState {
     provider: Arc<dyn VersionProvider>,
     // Held across the upstream fetch, so concurrent requests on a cold or
     // stale cache trigger only one refresh.
     cache: Arc<Mutex<Option<CacheEntry>>>,
-    /// `None` when deploying is disabled
-    deploy: Option<DeployState>,
+    /// `None` when the package type has no deployer yet
+    deployer: Option<Arc<dyn Deployer>>,
     /// Only one deployment at a time
     deploy_lock: Arc<Mutex<()>>,
+    /// Origins allowed to call the API from a browser (normalized, no trailing slash)
+    allowed_origins: Arc<Vec<String>>,
 }
 
 // ---------- errors ----------
@@ -204,21 +201,21 @@ async fn get_versions(
     }))
 }
 
-/// Download a release, swap the binary and restart the service
+/// Download a release, swap the binary and restart the service.
+/// Requests must carry an `Origin` header matching one of the allowed origins.
 #[utoipa::path(
     post,
     path = "/deploy",
     tag = "deploy",
     params(DeployQuery),
-    security(("bearer" = [])),
     responses(
         (status = 200, description = "Deployed", body = DeployOutcome),
         (status = 400, description = "Invalid version", body = String),
-        (status = 401, description = "Missing or invalid token", body = String),
+        (status = 403, description = "Origin missing or not allowed", body = String),
         (status = 404, description = "Release or asset not found", body = String),
         (status = 409, description = "A deployment is already running", body = String),
         (status = 500, description = "Install or systemctl failure", body = String),
-        (status = 501, description = "Deploying is not enabled", body = String),
+        (status = 501, description = "No deployer for this package type", body = String),
         (status = 502, description = "Upstream provider error", body = String),
     )
 )]
@@ -227,23 +224,26 @@ async fn deploy_version(
     headers: HeaderMap,
     Query(q): Query<DeployQuery>,
 ) -> Result<Json<DeployOutcome>, AppError> {
-    let cfg = state.deploy.as_ref().ok_or_else(|| {
-        AppError::new(
-            StatusCode::NOT_IMPLEMENTED,
-            "Deploying is not enabled (needs DEPLOY_TOKEN and a package type with a deployer)",
-        )
-    })?;
-
-    let provided = headers
-        .get(AUTHORIZATION)
+    let origin_ok = headers
+        .get(ORIGIN)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if !provided.is_some_and(|t| tokens_match(t.as_bytes(), cfg.token.as_bytes())) {
+        .is_some_and(|o| {
+            let o = o.trim_end_matches('/');
+            state.allowed_origins.iter().any(|a| a == o)
+        });
+    if !origin_ok {
         return Err(AppError::new(
-            StatusCode::UNAUTHORIZED,
-            "Missing or invalid bearer token",
+            StatusCode::FORBIDDEN,
+            "Origin missing or not allowed",
         ));
     }
+
+    let deployer = state.deployer.clone().ok_or_else(|| {
+        AppError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "Deploying is not supported for this package type yet",
+        )
+    })?;
 
     let version = q.version.unwrap_or_else(|| "latest".to_string());
     if !valid_version(&version) {
@@ -257,7 +257,6 @@ async fn deploy_version(
 
     // Run in its own task: if the client disconnects mid-request, axum drops
     // this handler, and a half-finished stop/swap/start must not be cut off.
-    let deployer = cfg.deployer.clone();
     let outcome = tokio::spawn(async move {
         let _guard = guard;
         deployer.deploy(&version).await
@@ -280,29 +279,12 @@ fn valid_version(v: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
 }
 
-fn tokens_match(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 // ---------- OpenAPI ----------
-
-struct SecurityAddon;
-
-impl Modify for SecurityAddon {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        let components = openapi.components.get_or_insert_with(Default::default);
-        components.add_security_scheme(
-            "bearer",
-            SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer).build()),
-        );
-    }
-}
 
 #[derive(OpenApi)]
 #[openapi(
     paths(get_versions, deploy_version),
     components(schemas(ReleaseInfo, DeployOutcome)),
-    modifiers(&SecurityAddon),
     info(
         title = "Version Tracker",
         description = "Release version tracker and deployer"
@@ -317,10 +299,18 @@ struct ApiDoc;
 pub struct Args {
     #[arg(long, env = "PORT", default_value = "11234")]
     port: u16,
+    /// Address to listen on. Defaults to loopback; use 0.0.0.0 to expose it.
+    #[arg(long, env = "BIND", default_value = "127.0.0.1")]
+    bind: IpAddr,
     #[arg(long, env = "SOFTWARE_URL")]
     software_url: String,
     #[arg(long, env = "SOFTWARE_PACKAGE_TYPE")]
     software_package_type: SoftwarePackageType,
+
+    /// Origin(s) the frontend is served from, e.g. https://ui.example.com
+    /// (comma-separated for several). Used for CORS and enforced on /deploy.
+    #[arg(long, env = "ALLOWED_ORIGIN", required = true, value_delimiter = ',')]
+    allowed_origins: Vec<String>,
 
     /// systemd unit and binary name (default: the repository name)
     #[arg(long, env = "SERVICE_NAME")]
@@ -331,9 +321,6 @@ pub struct Args {
     /// Release asset to install; "{name}" is replaced by the service name
     #[arg(long, env = "ASSET_NAME", default_value = "{name}-linux-aarch64")]
     asset_name: String,
-    /// Bearer token required for POST /deploy. Deploying is disabled without it.
-    #[arg(long, env = "DEPLOY_TOKEN", hide_env_values = true)]
-    deploy_token: Option<String>,
 }
 
 #[tokio::main]
@@ -348,6 +335,22 @@ async fn main() -> Result<(), Error> {
         .init();
 
     let args = Args::parse();
+
+    // Normalize origins (no trailing slash) and make sure they're valid header values
+    let allowed_origins: Vec<String> = args
+        .allowed_origins
+        .iter()
+        .map(|o| o.trim().trim_end_matches('/').to_owned())
+        .filter(|o| !o.is_empty())
+        .collect();
+    if allowed_origins.is_empty() {
+        anyhow::bail!("ALLOWED_ORIGIN must contain at least one origin");
+    }
+    let origin_headers = allowed_origins
+        .iter()
+        .map(|o| HeaderValue::from_str(o).map_err(|_| anyhow::anyhow!("Invalid origin: {o}")))
+        .collect::<Result<Vec<_>>>()?;
+    tracing::info!("allowed origins: {}", allowed_origins.join(", "));
 
     let client = reqwest::Client::builder()
         .user_agent(concat!("version_tracker/", env!("CARGO_PKG_VERSION")))
@@ -376,36 +379,23 @@ async fn main() -> Result<(), Error> {
             asset_name: asset_name.clone(),
         },
     )?;
-
-    let deploy = match (args.deploy_token, deployer) {
-        (Some(token), Some(deployer)) => {
-            tracing::info!("deploy enabled: service '{service_name}', asset '{asset_name}'");
-            Some(DeployState {
-                deployer,
-                token: Arc::from(token),
-            })
-        }
-        (None, _) => {
-            tracing::warn!("deploy disabled: DEPLOY_TOKEN is not set");
-            None
-        }
-        (_, None) => {
-            tracing::warn!("deploy disabled: no deployer for this package type yet");
-            None
-        }
-    };
+    match &deployer {
+        Some(_) => tracing::info!("deploy enabled: service '{service_name}', asset '{asset_name}'"),
+        None => tracing::warn!("deploy disabled: no deployer for this package type yet"),
+    }
 
     let state = AppState {
         provider,
         cache: Arc::new(Mutex::new(None)),
-        deploy,
+        deployer,
         deploy_lock: Arc::new(Mutex::new(())),
+        allowed_origins: Arc::new(allowed_origins),
     };
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::list(origin_headers))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([CONTENT_TYPE]);
 
     let app = Router::new()
         .route("/versions", get(get_versions))
@@ -414,8 +404,9 @@ async fn main() -> Result<(), Error> {
         .with_state(state)
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", args.port)).await?;
-    tracing::debug!("listening on {}", listener.local_addr()?);
+    let addr = SocketAddr::new(args.bind, args.port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("listening on {}", listener.local_addr()?);
 
     Ok(axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
