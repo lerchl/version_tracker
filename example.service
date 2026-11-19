@@ -1,0 +1,35 @@
+[Unit]
+Description=Version Tracker (release lookup and deployer)
+Documentation=https://github.com/lerchl/version_tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/version_tracker
+EnvironmentFile=/etc/version_tracker.env
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Needs root: it writes to the install dir and runs `systemctl stop/start`.
+User=root
+
+# --- Hardening (compatible with deploying) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+# The only place it may write, i.e. INSTALL_DIR
+ReadWritePaths=/usr/local/bin
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# AF_UNIX is required so systemctl can reach systemd
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
