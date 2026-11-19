@@ -1,0 +1,31 @@
+[package]
+name = "version_tracker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "time", "process", "fs", "signal", "sync"] }
+utoipa = "5"
+utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+clap = { version = "4", features = ["derive", "env"] }
+semver = { version = "1", features = ["serde"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower = { version = "0.5.2", features = ["util", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+dotenvy = "0.15.7"
+async-trait = "0.1"
+# sha2 = "0.11"   # only if you verify checksums in Rust
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
