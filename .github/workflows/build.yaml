@@ -4,8 +4,11 @@ on:
   push:
     branches:
       - main
+      - develop
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: ubuntu-22.04-arm
@@ -13,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Cache Rust dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -24,22 +27,39 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Get version from Cargo.toml
-        id: cargo_version
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
-      - name: Build release binary
+      - name: Build (develop)
+        if: github.ref == 'refs/heads/develop'
+        run: cargo build
+
+      - name: Build (main)
+        if: github.ref == 'refs/heads/main'
         run: cargo build --release
 
-      - name: Rename binary
-        run: |
-          cp target/release/version_tracker version_tracker-linux-aarch64
+      - name: Rename binary (develop)
+        if: github.ref == 'refs/heads/develop'
+        run: cp target/debug/version_tracker version_tracker-linux-aarch64
+
+      - name: Rename binary (main)
+        if: github.ref == 'refs/heads/main'
+        run: cp target/release/version_tracker version_tracker-linux-aarch64
 
       - name: Create GitHub Release and upload binary
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.VERSION }}
           name: v${{ env.VERSION }}
           files: version_tracker-linux-aarch64
           make_latest: true
+
+      - name: Upload dev artifact
+        if: github.ref == 'refs/heads/develop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: version_tracker-dev-${{ github.sha }}
+          path: version_tracker-linux-aarch64
+          retention-days: 7
