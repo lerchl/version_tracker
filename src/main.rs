@@ -54,6 +54,8 @@ struct ServiceConfig {
     install_dir: Option<PathBuf>,
     /// "{name}" is replaced by the service name
     asset_name: Option<String>,
+    /// Image repository without tag, for package_type = "image"
+    image: Option<String>,
 }
 
 fn default_install_dir() -> PathBuf {
@@ -174,7 +176,9 @@ impl From<DeployError> for AppError {
                 StatusCode::NOT_FOUND
             }
             DeployError::Provider(_) | DeployError::Download(_) => StatusCode::BAD_GATEWAY,
-            DeployError::Io(_) | DeployError::Systemctl { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            DeployError::Io(_) | DeployError::Systemctl { .. } | DeployError::Command { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
         Self::new(status, e.to_string())
     }
@@ -445,6 +449,7 @@ async fn main() -> Result<(), Error> {
                 service_name: name.clone(),
                 install_dir,
                 asset_name: asset_name.clone(),
+                image: sc.image,
             },
         )
         .with_context(|| format!("service '{name}'"))?;

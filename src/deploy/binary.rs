@@ -124,7 +124,6 @@ impl Deployer for BinaryDeployer {
         Ok(DeployOutcome {
             service: self.service_name.clone(),
             version: asset.version,
-            binary_path: self.binary_path.to_string_lossy().into_owned(),
         })
     }
 }

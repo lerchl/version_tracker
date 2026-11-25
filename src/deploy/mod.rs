@@ -1,4 +1,5 @@
 mod binary;
+mod image;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -6,7 +7,10 @@ use async_trait::async_trait;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::provider::{ProviderError, SoftwarePackageType, VersionProvider};
+use crate::{
+    deploy::image::ImageDeployer,
+    provider::{ProviderError, SoftwarePackageType, VersionProvider},
+};
 use binary::BinaryDeployer;
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -14,7 +18,6 @@ pub struct DeployOutcome {
     pub service: String,
     /// Release tag that was deployed, as named by the provider
     pub version: String,
-    pub binary_path: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +30,11 @@ pub enum DeployError {
     Io(#[from] std::io::Error),
     #[error("systemctl {action} failed: {detail}")]
     Systemctl {
+        action: &'static str,
+        detail: String,
+    },
+    #[error("{action} failed: {detail}")]
+    Command {
         action: &'static str,
         detail: String,
     },
@@ -44,6 +52,8 @@ pub struct DeployOptions {
     pub install_dir: PathBuf,
     /// Name of the release asset to install
     pub asset_name: String,
+    /// Image repository without tag (image)
+    pub image: Option<String>,
 }
 
 /// Picks a deployer for the package type. `None` means deploying isn't
@@ -58,7 +68,6 @@ pub fn build_deployer(
         SoftwarePackageType::Binary => {
             Ok(Some(Arc::new(BinaryDeployer::new(client, provider, opts)?)))
         }
-        // e.g. an ImageDeployer that runs `docker pull` and restarts a compose service
-        SoftwarePackageType::Image => Ok(None),
+        SoftwarePackageType::Image => Ok(Some(Arc::new(ImageDeployer::new(opts)?))),
     }
 }
